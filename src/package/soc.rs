@@ -4,7 +4,16 @@ use std::fs;
 use std::path::Path;
 
 use super::binpkg::{parse_binpkg, rehash_entry, serialize_binpkg, BinpkgEntry, BinpkgResult};
-use super::info::parse_info_json;
+use super::info::{parse_info_json, InfoJson};
+
+fn chip_from_info_json(info: &InfoJson) -> Option<String> {
+    info.chip
+        .as_ref()
+        .and_then(|chip| chip.chip_type.as_deref())
+        .map(str::trim)
+        .filter(|chip| !chip.is_empty())
+        .map(ToOwned::to_owned)
+}
 
 /// Parse a SOC file (7z archive) containing binpkg, info.json, and optional script.bin.
 ///
@@ -38,6 +47,15 @@ pub fn parse_soc(path: &Path, keep_data: bool) -> Result<BinpkgResult> {
     let binpkg_bytes =
         binpkg_data.ok_or_else(|| anyhow::anyhow!("No .binpkg file found in SOC archive"))?;
     let mut result = parse_binpkg(&binpkg_bytes, keep_data)?;
+    let info = info_json_data
+        .as_ref()
+        .and_then(|bytes| parse_info_json(bytes).ok());
+
+    if result.chip == super::binpkg::UNKNOWN_CHIP {
+        if let Some(info_chip) = info.as_ref().and_then(chip_from_info_json) {
+            result.chip = info_chip;
+        }
+    }
 
     // Handle script.bin
     if let Some((_fname, sdata)) = script_data {
@@ -74,13 +92,11 @@ pub fn parse_soc(path: &Path, keep_data: bool) -> Result<BinpkgResult> {
     }
 
     // Read force_br from info.json
-    if let Some(ref info_bytes) = info_json_data {
-        if let Ok(info) = parse_info_json(info_bytes) {
-            if let Some(download) = &info.download {
-                if let Some(ref br) = download.force_br {
-                    if let Ok(v) = br.parse::<u32>() {
-                        result.force_br = Some(v);
-                    }
+    if let Some(info) = info.as_ref() {
+        if let Some(download) = &info.download {
+            if let Some(ref br) = download.force_br {
+                if let Ok(v) = br.parse::<u32>() {
+                    result.force_br = Some(v);
                 }
             }
         }
@@ -119,15 +135,16 @@ pub fn read_soc_metadata(path: &Path) -> Result<SocMetadata> {
             break;
         }
     }
-    let chip = chip.ok_or_else(|| anyhow::anyhow!("No chip found in SOC binpkg header"))?;
-    if chip == super::binpkg::UNKNOWN_CHIP {
-        bail!("Unable to determine chip type from SOC binpkg header");
-    }
-
     // Read script_addr and force_br from info.json
     let info_path = tmppath.join("info.json");
     let info_bytes = fs::read(&info_path).context("No info.json in SOC")?;
     let info = parse_info_json(&info_bytes)?;
+    let chip = chip
+        .filter(|chip| chip != super::binpkg::UNKNOWN_CHIP)
+        .or_else(|| chip_from_info_json(&info))
+        .ok_or_else(|| {
+            anyhow::anyhow!("Unable to determine chip type from SOC binpkg or info.json")
+        })?;
 
     let download = info
         .download
