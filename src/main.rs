@@ -16,7 +16,7 @@ use cli::{Cli, Commands};
 use flash::burn::{burn_agboot, burn_img, load_agentboot, sys_reset};
 use flash::consts::*;
 use flash::sync::burn_sync;
-use lua::compiler::compile_lua;
+use lua::compiler::{compile_lua, init_lua_helper_cache};
 use luadb::pack::{pack_luadb, LuadbEntry};
 use serial::detect::{
     resolve_port, BOOT_PID, BOOT_VID, LOG_COMM_INTERFACE, LOG_DATA_INTERFACE, LOG_PID, LOG_VID,
@@ -24,7 +24,12 @@ use serial::detect::{
 use serial::port::{open_port, PortType};
 
 /// Add a single file to the entry list, compiling .lua files.
-fn add_file_entry(path: &Path, entries: &mut Vec<LuadbEntry>, strip: bool, lua_bitw: u32) -> Result<()> {
+fn add_file_entry(
+    path: &Path,
+    entries: &mut Vec<LuadbEntry>,
+    strip: bool,
+    lua_bitw: u32,
+) -> Result<()> {
     let filename = path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("No filename for {}", path.display()))?
@@ -100,7 +105,11 @@ fn collect_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
 
 /// Compile Lua files and pack into script.bin bytes.
 /// Accepts a list of files and/or directories.
-fn generate_script_bin(paths: &[std::path::PathBuf], strip: bool, lua_bitw: u32) -> Result<Vec<u8>> {
+fn generate_script_bin(
+    paths: &[std::path::PathBuf],
+    strip: bool,
+    lua_bitw: u32,
+) -> Result<Vec<u8>> {
     if paths.is_empty() {
         bail!("No input paths specified");
     }
@@ -854,11 +863,7 @@ fn dev_enter_alt_screen(status: &str, device: &logs::status::DeviceStatus) {
     let (_cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let mut out = std::io::stderr().lock();
     // Enter alt screen, clear it, set scroll region, position cursor at top
-    let _ = write!(
-        out,
-        "\x1b[?1049h\x1b[2J\x1b[1;{}r\x1b[1;1H",
-        rows - 1
-    );
+    let _ = write!(out, "\x1b[?1049h\x1b[2J\x1b[1;{}r\x1b[1;1H", rows - 1);
     let _ = out.flush();
     drop(out);
     dev_draw_banner(status, device);
@@ -895,7 +900,11 @@ fn wait_for_port_interruptible(
     use std::time::Duration;
 
     let infinite = timeout_secs == 0;
-    let max_iterations = if infinite { u32::MAX } else { timeout_secs * 10 };
+    let max_iterations = if infinite {
+        u32::MAX
+    } else {
+        timeout_secs * 10
+    };
     for _ in 0..max_iterations {
         if let Some(port) = serial::detect::auto_detect_port(vid, pid, interfaces) {
             return Ok(Some(port));
@@ -1061,8 +1070,7 @@ fn cmd_dev(
                 std::thread::sleep(Duration::from_secs(2));
                 continue;
             }
-            DevAction::Burn => {
-            }
+            DevAction::Burn => {}
         }
 
         // Drain any queued key events
@@ -1176,6 +1184,13 @@ fn main() -> Result<()> {
         .format_target(false)
         .format_timestamp(None)
         .init();
+
+    match &cli.command {
+        Commands::Script { .. } | Commands::Pack { .. } | Commands::Dev { .. } => {
+            init_lua_helper_cache().map_err(anyhow::Error::msg)?;
+        }
+        _ => {}
+    }
 
     match &cli.command {
         Commands::Script {

@@ -41,7 +41,10 @@ pub fn chip_family(chip_name: &str) -> Result<&'static str> {
     } else if chip.starts_with("EC618") {
         Ok("ec618")
     } else {
-        bail!("Unable to determine chip family from chip name: {}", chip_name)
+        bail!(
+            "Unable to determine chip family from chip name: {}",
+            chip_name
+        )
     }
 }
 

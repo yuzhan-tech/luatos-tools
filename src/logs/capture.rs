@@ -388,7 +388,10 @@ mod tests {
         let mut ctx = LogContext::new();
         let msgs = log_parse(&mut ctx, &frame);
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].text, "am_get_chip_type 865:6bef6,1b,64,db,10,EC718HM");
+        assert_eq!(
+            msgs[0].text,
+            "am_get_chip_type 865:6bef6,1b,64,db,10,EC718HM"
+        );
     }
 
     #[test]

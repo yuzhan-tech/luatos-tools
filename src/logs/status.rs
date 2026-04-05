@@ -204,19 +204,23 @@ impl DeviceStatus {
 
         let lua_mem = self
             .lua_total
-            .map(|total| format!(
-                "{}/{}KB(lua)",
-                self.lua_used.unwrap_or(0) / 1024,
-                total / 1024
-            ))
+            .map(|total| {
+                format!(
+                    "{}/{}KB(lua)",
+                    self.lua_used.unwrap_or(0) / 1024,
+                    total / 1024
+                )
+            })
             .unwrap_or_else(|| "-(lua)".to_string());
         let sys_mem = self
             .psram_total
-            .map(|total| format!(
-                "{}/{}KB(sys)",
-                self.psram_used.unwrap_or(0) / 1024,
-                total / 1024
-            ))
+            .map(|total| {
+                format!(
+                    "{}/{}KB(sys)",
+                    self.psram_used.unwrap_or(0) / 1024,
+                    total / 1024
+                )
+            })
             .unwrap_or_else(|| "-(sys)".to_string());
         println!("{:<12}{} {}", "Memory:", lua_mem, sys_mem);
         if let Some(cnt) = self.error_count {
@@ -258,7 +262,8 @@ impl StatusParser {
             re_baseinfo: Regex::new(r"BASEINFO:(\S*?),(\S+)").unwrap(),
             re_socsq: Regex::new(r"\+SOCSQ: (\S+),(\S+),(\S+)").unwrap(),
             re_csq: Regex::new(r"\+CSQ:.* (\d+)").unwrap(),
-            re_soccell: Regex::new(r"\+SOCCELL: ([[:xdigit:]]+),([[:xdigit:]]+),(\d+),(\d+),(\d+)").unwrap(),
+            re_soccell: Regex::new(r"\+SOCCELL: ([[:xdigit:]]+),([[:xdigit:]]+),(\d+),(\d+),(\d+)")
+                .unwrap(),
             re_socreg: Regex::new(r"\+SOCREG: (\d+),(\S+)").unwrap(),
             re_cereg: Regex::new(r"\+CEREG: \d+,(\d+)").unwrap(),
             re_cgatt: Regex::new(r"\+CGATT: (\d)").unwrap(),

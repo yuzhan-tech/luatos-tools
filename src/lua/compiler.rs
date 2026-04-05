@@ -1,8 +1,11 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-const LUA53_HELPER_32: &str = env!("LUA53_HELPER_32");
-const LUA53_HELPER_64: &str = env!("LUA53_HELPER_64");
+use super::embedded_helpers::{ensure_embedded_helper, init_helper_cache};
+
+pub fn init_lua_helper_cache() -> Result<(), String> {
+    init_helper_cache()
+}
 
 /// Compile Lua source to bytecode for the requested Lua bitness.
 /// When `strip` is true, debug info is removed for smaller output.
@@ -13,20 +16,23 @@ pub fn compile_lua(
     strip: bool,
     bitw: u32,
 ) -> Result<Vec<u8>, String> {
-    let helper = match bitw {
-        32 => LUA53_HELPER_32,
-        64 => LUA53_HELPER_64,
-        _ => return Err(format!("unsupported Lua bitness: {}", bitw)),
-    };
+    let helper = ensure_embedded_helper(bitw)?;
 
-    let mut child = Command::new(helper)
+    let mut child = Command::new(&helper)
         .arg(chunk_name)
         .arg(if strip { "1" } else { "0" })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("failed to spawn Lua {}-bit compiler: {}", bitw, e))?;
+        .map_err(|e| {
+            format!(
+                "failed to spawn Lua {}-bit compiler from {}: {}",
+                bitw,
+                helper.display(),
+                e
+            )
+        })?;
 
     if let Some(stdin) = child.stdin.as_mut() {
         stdin

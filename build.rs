@@ -98,7 +98,11 @@ fn build_lua_helper(lua_src: &str, out_dir: &Path, bitw: u32, target_os: &str) {
         panic!("Failed to build Lua {}-bit helper", bitw);
     }
 
-    println!("cargo:rustc-env=LUA53_HELPER_{}={}", bitw, output.display());
+    println!(
+        "cargo:rustc-env=LUA53_HELPER_EMBED_{}={}",
+        bitw,
+        output.display()
+    );
 }
 
 fn main() {
@@ -111,7 +115,10 @@ fn main() {
     for file in core_files(lua_src) {
         build.file(file);
     }
-    build.include(lua_src).define("LUA_32BITS", None).warnings(false);
+    build
+        .include(lua_src)
+        .define("LUA_32BITS", None)
+        .warnings(false);
     apply_os_defines(&mut build, &target_os);
     build.compile("lua53");
 
