@@ -2,6 +2,8 @@
 
 `luatos-tools` is a Rust CLI for LuatOS firmware packaging, script deployment, flashing, and serial monitoring on EC618 and EC7xx modules.
 
+[简体中文文档](./README.zh-CN.md)
+
 ## Features
 
 - Build `script.bin` from Lua files and bundled resources.
