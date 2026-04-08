@@ -952,13 +952,7 @@ fn cmd_dev(
     crossterm::terminal::enable_raw_mode()?;
     dev_reset_screen();
 
-    let mut first_connect = true;
     loop {
-        if first_connect {
-            first_connect = false;
-        } else {
-            dev_clear_output();
-        }
         dev_draw_banner("Connecting...", &status_parser.status);
 
         let log_port_name = if port == "auto" {
@@ -989,6 +983,7 @@ fn cmd_dev(
         let mut ctx = logs::capture::LogContext::new();
         let mut buf = [0u8; 512];
 
+        dev_clear_output();
         dev_draw_banner("", &status_parser.status);
 
         enum DevAction {
