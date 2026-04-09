@@ -1,198 +1,134 @@
 # luatos-tools
 
-`luatos-tools` 是一个 Rust 编写的 CLI 工具，用于 LuatOS 在 EC618/EC7xx 模组上的固件打包、脚本部署、烧录和串口监控。
+LuatOS 在 EC618 / EC7xx 模组上的固件构建、烧录与调试 CLI 工具。
 
-## 功能特性
+[English](./README.md)
 
-- 将 Lua 脚本与资源文件打包为 `script.bin`
-- 自动将 `.lua` 编译为字节码，并支持生产模式去除调试信息
-- 在提供基础 SOC 镜像时，自动推断并匹配 Lua 字节码位宽
-- 基于基础 `.soc` 镜像重打包新的 `script.bin`
-- 从基础 SOC 生成生产发布用 `.binpkg`
-- 烧录 `.soc` 和 `.binpkg` 到支持的模组
-- 支持按分区烧录（`--only bl,ap,cp,script`）
-- 支持 `-p auto` 自动识别串口
-- 支持串口日志解码输出或原始十六进制输出
-- 提供实时设备状态面板或事件流输出
-- 开发模式下可持续看日志，并通过 `Ctrl+B` 快速重烧脚本
+## 安装
 
-## 环境要求
+### macOS / Linux（Homebrew）
 
-- Rust stable 工具链
-- 可访问的 USB 设备（目标 LuatOS 模组）
-- 使用 `pack`、`dev` 或 `script --burn` 时需要基础 SOC 镜像
+```bash
+brew tap yuzhan-tech/tap
+brew install luatos-tools
+```
+
+### Windows
+
+从 [Releases](https://github.com/yuzhan-tech/luatos-tools/releases) 下载最新的 `x86_64-pc-windows-gnu.zip`，解压后将 `luatos-tools.exe` 放入 `PATH` 即可使用。
 
 ## 快速开始
 
-使用 Cargo 运行：
+接好设备，使用基础 SOC 镜像启动开发循环：
 
 ```bash
-cargo run -- <command> [args]
+luatos-tools dev ./lua -i base.soc
 ```
 
-或使用编译后的二进制：
+工具会持续输出设备日志。按 `Ctrl+B` 即可重新构建并烧录脚本，无需重连设备。
+
+## 命令
+
+所有命令默认通过 USB 自动识别串口。如需手动指定，使用 `-p <port>` 参数。
+
+### `dev` — 快速迭代
+
+实时日志 + `Ctrl+B` 重烧脚本：
 
 ```bash
-./target/debug/luatos-tools <command> [args]
+luatos-tools dev ./lua -i base.soc
 ```
 
-## 主要命令
-
-### `script`
-
-从一个或多个文件/目录生成 `script.bin`：
+### `script` — 构建 `script.bin`
 
 ```bash
 luatos-tools script ./lua -o script.bin
 ```
 
-编译独立 64 位 Lua 字节码：
+构建后立即烧录：
 
 ```bash
-luatos-tools script ./lua -o script.bin --lua-bitw 64
+luatos-tools script ./lua -i base.soc --burn
 ```
 
-生成生产包（去除 Lua 调试信息）：
+生产模式（去除 Lua 调试信息）：
 
 ```bash
 luatos-tools script ./lua -o script.bin -P
 ```
 
-生成后立即烧录：
+### `pack` — 打包完整固件镜像
+
+基于基础 SOC 重打包：
 
 ```bash
-luatos-tools script ./lua --burn --base-image ./base.soc --port auto --port-type usb
+luatos-tools pack ./lua -i base.soc -o release.soc
 ```
 
-### `pack`
-
-基于基础 SOC 镜像和 Lua 资源打包：
+生成发布用 `binpkg`：
 
 ```bash
-luatos-tools pack ./lua --base-image ./base.soc --output ./out.soc
+luatos-tools pack ./lua -i base.soc -o release.binpkg -P
 ```
 
-输出生产用 `binpkg`：
+### `burn` — 烧录固件
 
 ```bash
-luatos-tools pack ./lua --base-image ./base.soc --output ./out.binpkg -P
+luatos-tools burn firmware.soc
 ```
 
-### `burn`
-
-烧录 SOC 或 `binpkg`：
+只烧录指定分区（可选 `bl`、`ap`、`cp`、`script`）：
 
 ```bash
-luatos-tools burn ./firmware.soc --port auto --port-type usb
+luatos-tools burn firmware.soc --only script
+luatos-tools burn firmware.soc --only bl,ap
 ```
 
-只烧录指定分区：
+### `logs` — 串口日志
 
 ```bash
-luatos-tools burn ./firmware.soc --only bl,ap
-luatos-tools burn ./firmware.soc --only script
+luatos-tools logs
 ```
 
-### `logs`
-
-串口日志采集：
+十六进制原始帧输出：
 
 ```bash
-luatos-tools logs --port auto --baud 2000000
+luatos-tools logs --hex
 ```
 
-十六进制原始输出：
+### `monitor` — 设备状态
+
+实时面板：
 
 ```bash
-luatos-tools logs --port auto --baud 2000000 --hex
+luatos-tools monitor
 ```
 
-### `monitor`
-
-设备状态监控：
+事件流模式：
 
 ```bash
-luatos-tools monitor --port auto --baud 2000000
+luatos-tools monitor --stream
 ```
 
-事件流输出：
+## 常见问题
 
-```bash
-luatos-tools monitor --port auto --baud 2000000 --stream
-```
+**串口被占用。** 关闭其他串口监控或烧录工具后重试。
 
-### `dev`
+**烧录中途失败。** 使用直连 USB（避免使用 USB Hub），并确认供电稳定。
 
-开发循环（日志 + 快速重烧）：
+**芯片识别失败。** 显式指定 `--chip`，例如 `--chip ec618` 或 `--chip ec718m`。
 
-```bash
-luatos-tools dev ./lua --base-image ./base.soc --port auto --port-type usb --baud 2000000
-```
+**自动识别选错串口。** 使用 `-p` 手动指定，例如 `-p /dev/tty.usbserial-XXXX`（macOS/Linux）或 `-p COM5`（Windows）。
 
-运行 `dev` 时：
+## 从源码构建
 
-- 持续输出设备日志
-- 按 `Ctrl+B` 重新构建并烧录脚本
-- 使用基础镜像中的脚本布局和烧录元数据
-
-## 常见流程
-
-快速迭代脚本：
-
-```bash
-luatos-tools dev ./lua --base-image ./base.soc --port auto --port-type usb --baud 2000000
-```
-
-一次性构建并烧录脚本：
-
-```bash
-luatos-tools script ./lua --burn --base-image ./base.soc --port auto --port-type usb
-```
-
-打包发布 SOC：
-
-```bash
-luatos-tools pack ./lua --base-image ./base.soc --output ./release.soc
-```
-
-打包发布生产 `binpkg`：
-
-```bash
-luatos-tools pack ./lua --base-image ./base.soc --output ./release.binpkg -P
-```
-
-## 构建与开发
-
-构建项目：
-
-```bash
-cargo build
-```
-
-发布构建：
+需要 Rust stable 工具链。Linux 上还需安装 `libudev-dev` 和 `pkg-config`。
 
 ```bash
 cargo build --release
-```
-
-运行测试：
-
-```bash
-cargo test
-```
-
-运行 clippy：
-
-```bash
-cargo clippy --all-targets --all-features
-```
-
-查看命令帮助：
-
-```bash
-cargo run -- --help
+./target/release/luatos-tools --help
 ```
 
 ## License
 
-本项目使用 [MIT License](./LICENSE)。
+[MIT](./LICENSE)
