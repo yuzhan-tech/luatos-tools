@@ -6,6 +6,54 @@ use std::path::Path;
 use super::binpkg::{parse_binpkg, rehash_entry, serialize_binpkg, BinpkgEntry, BinpkgResult};
 use super::info::{parse_info_json, InfoJson};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlashPartition {
+    pub name: String,
+    pub addr: u32,
+    pub size: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FlashPartitions {
+    pub partitions: Vec<FlashPartition>,
+}
+
+impl FlashPartitions {
+    fn add(&mut self, name: &str, addr: u32, size: u32) {
+        if size == 0 {
+            return;
+        }
+        if let Some(existing) = self.partitions.iter_mut().find(|p| p.name == name) {
+            existing.addr = addr;
+            existing.size = size;
+        } else {
+            self.partitions.push(FlashPartition {
+                name: name.to_string(),
+                addr,
+                size,
+            });
+        }
+    }
+
+    pub fn find(&self, name: &str) -> Option<&FlashPartition> {
+        let canonical = canonical_partition_name(name);
+        self.partitions.iter().find(|p| p.name == canonical)
+    }
+
+    pub fn available_names(&self) -> Vec<String> {
+        self.partitions.iter().map(|p| p.name.clone()).collect()
+    }
+}
+
+pub fn canonical_partition_name(name: &str) -> &str {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "kv" | "fdb" | "nvm" => "kv",
+        "fs" | "filesystem" | "file-system" => "fs",
+        "platconfig" | "plat_config" | "platform" | "factory" | "fact" | "config" => "platconfig",
+        _ => name.trim(),
+    }
+}
+
 fn chip_from_info_json(info: &InfoJson) -> Option<String> {
     info.chip
         .as_ref()
@@ -13,6 +61,87 @@ fn chip_from_info_json(info: &InfoJson) -> Option<String> {
         .map(str::trim)
         .filter(|chip| !chip.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn parse_hex_define(data: &str, name: &str) -> Option<u32> {
+    let needle = format!("#define {}", name);
+    for line in data.lines() {
+        let line = line.trim();
+        if !line.starts_with(&needle) {
+            continue;
+        }
+        let value_start = line.find("0x").or_else(|| line.find("0X"))?;
+        let value = line[value_start + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect::<String>();
+        if value.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = u32::from_str_radix(&value, 16) {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+fn add_ec618_partition_defaults(parts: &mut FlashPartitions, mem_map: Option<&str>) {
+    let fs_start = mem_map
+        .and_then(|data| parse_hex_define(data, "FLASH_FOTA_REGION_END"))
+        .unwrap_or(0x384000);
+    if parts.find("fs").is_none() && fs_start < 0x3cc000 {
+        parts.add("fs", fs_start, 0x3cc000 - fs_start);
+    }
+    if parts.find("kv").is_none() {
+        parts.add("kv", 0x3cc000, 0x10000);
+    }
+    if parts.find("platconfig").is_none() {
+        parts.add("platconfig", 0x3fc000, 0x4000);
+    }
+}
+
+fn partitions_from_mem_map(data: &str, chip: Option<&str>) -> FlashPartitions {
+    let mut parts = FlashPartitions::default();
+
+    if let (Some(start), Some(end)) = (
+        parse_hex_define(data, "FLASH_FS_REGION_START"),
+        parse_hex_define(data, "FLASH_FS_REGION_END"),
+    ) {
+        if end > start {
+            parts.add("fs", start, end - start);
+        }
+    }
+
+    if let (Some(start), Some(end)) = (
+        parse_hex_define(data, "FLASH_FDB_REGION_START"),
+        parse_hex_define(data, "FLASH_FDB_REGION_END"),
+    ) {
+        if end > start {
+            parts.add("kv", start, end - start);
+        }
+    }
+
+    if let (Some(addr), Some(size)) = (
+        parse_hex_define(data, "FLASH_MEM_PLAT_INFO_NONXIP_ADDR"),
+        parse_hex_define(data, "FLASH_MEM_PLAT_INFO_SIZE"),
+    ) {
+        parts.add("platconfig", addr, size);
+    }
+
+    if chip
+        .map(|c| c.to_ascii_uppercase().contains("EC618"))
+        .unwrap_or(false)
+    {
+        add_ec618_partition_defaults(&mut parts, Some(data));
+    }
+
+    parts
+}
+
+fn merge_partitions(dst: &mut FlashPartitions, src: FlashPartitions) {
+    for part in src.partitions {
+        dst.add(&part.name, part.addr, part.size);
+    }
 }
 
 /// Parse a SOC file (7z archive) containing binpkg, info.json, and optional script.bin.
@@ -191,6 +320,73 @@ pub fn parse_package(path: &Path, keep_data: bool) -> Result<BinpkgResult> {
     }
 }
 
+/// Read eraseable user partitions from a SOC/binpkg package.
+///
+/// EC7xx packages normally carry a preprocessed `mem_map.txt`, while EC618
+/// packages may carry `mem_map.h` and otherwise use the same defaults as the
+/// official LuaTools download path.
+pub fn read_package_partitions(path: &Path) -> Result<FlashPartitions> {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext != "soc" {
+        let fdata = fs::read(path)
+            .with_context(|| format!("Failed to read package: {}", path.display()))?;
+        let parsed = parse_binpkg(&fdata, false)?;
+        let mut parts = FlashPartitions::default();
+        if parsed.chip.to_ascii_uppercase().contains("EC618") {
+            add_ec618_partition_defaults(&mut parts, None);
+        }
+        return Ok(parts);
+    }
+
+    let tmpdir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let tmppath = tmpdir.path();
+
+    sevenz_rust2::decompress_file(path, tmppath)
+        .with_context(|| format!("Failed to extract SOC file: {}", path.display()))?;
+
+    let mut chip: Option<String> = None;
+    let mut mem_maps: Vec<String> = Vec::new();
+
+    for entry in fs::read_dir(tmppath).context("Failed to read temp directory")? {
+        let entry = entry?;
+        let fname = entry.file_name().to_string_lossy().to_string();
+        let fpath = entry.path();
+
+        if fname.ends_with(".binpkg") {
+            let fdata = fs::read(&fpath)?;
+            let parsed = parse_binpkg(&fdata, false)?;
+            if parsed.chip != super::binpkg::UNKNOWN_CHIP {
+                chip = Some(parsed.chip);
+            }
+        } else if fname == "info.json" {
+            let info = parse_info_json(&fs::read(&fpath)?)?;
+            if chip.is_none() {
+                chip = chip_from_info_json(&info);
+            }
+        } else if fname == "mem_map.txt" || fname == "mem_map.h" {
+            mem_maps.push(fs::read_to_string(&fpath)?);
+        }
+    }
+
+    let mut parts = FlashPartitions::default();
+    for mem_map in &mem_maps {
+        merge_partitions(
+            &mut parts,
+            partitions_from_mem_map(mem_map, chip.as_deref()),
+        );
+    }
+
+    if chip
+        .as_deref()
+        .map(|c| c.to_ascii_uppercase().contains("EC618"))
+        .unwrap_or(false)
+    {
+        add_ec618_partition_defaults(&mut parts, mem_maps.first().map(String::as_str));
+    }
+
+    Ok(parts)
+}
+
 /// Generate a .soc file by replacing script.bin in the base .soc archive.
 ///
 /// Streams entries from the base SOC directly into the output archive,
@@ -365,4 +561,42 @@ pub fn gen_production_binpkg(base_soc: &Path, script_bin: &[u8], output: &Path) 
         .with_context(|| format!("Failed to write binpkg: {}", output.display()))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_ec7xx_user_partitions_from_mem_map() {
+        let data = r#"
+#define FLASH_FS_REGION_START (0x3a1000)
+#define FLASH_FS_REGION_END (0x3c9000)
+#define FLASH_FDB_REGION_START (0x3c9000)
+#define FLASH_FDB_REGION_END (0x3d9000)
+#define FLASH_MEM_PLAT_INFO_NONXIP_ADDR (0x3fe000)
+#define FLASH_MEM_PLAT_INFO_SIZE (0x2000)
+"#;
+        let parts = partitions_from_mem_map(data, Some("EC718P_PRD"));
+        assert_eq!(
+            parts.find("fs").unwrap(),
+            &FlashPartition {
+                name: "fs".to_string(),
+                addr: 0x3a1000,
+                size: 0x28000,
+            }
+        );
+        assert_eq!(parts.find("fdb").unwrap().addr, 0x3c9000);
+        assert_eq!(parts.find("plat_config").unwrap().size, 0x2000);
+    }
+
+    #[test]
+    fn fills_ec618_defaults_from_fota_end() {
+        let data = "#define FLASH_FOTA_REGION_END (0x390000)";
+        let parts = partitions_from_mem_map(data, Some("EC618"));
+        assert_eq!(parts.find("fs").unwrap().addr, 0x390000);
+        assert_eq!(parts.find("fs").unwrap().size, 0x3cc000 - 0x390000);
+        assert_eq!(parts.find("kv").unwrap().addr, 0x3cc000);
+        assert_eq!(parts.find("platconfig").unwrap().addr, 0x3fc000);
+    }
 }

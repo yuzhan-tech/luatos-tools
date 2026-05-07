@@ -13,7 +13,7 @@ use std::fs;
 use std::path::Path;
 
 use cli::{Cli, Commands};
-use flash::burn::{burn_agboot, burn_img, load_agentboot, sys_reset};
+use flash::burn::{burn_agboot, burn_img, erase_flash_range, load_agentboot, sys_reset};
 use flash::consts::*;
 use flash::sync::burn_sync;
 use lua::compiler::{compile_lua, init_lua_helper_cache};
@@ -239,6 +239,23 @@ fn normalize_lua_bitw(lua_bitw: u32) -> Result<u32> {
         32 | 64 => Ok(lua_bitw),
         _ => bail!("Unsupported Lua bitness: {} (expected 32 or 64)", lua_bitw),
     }
+}
+
+fn parse_u32_arg(value: &str, label: &str) -> Result<u32> {
+    let trimmed = value.trim();
+    let (digits, radix) = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        (hex, 16)
+    } else if trimmed.chars().any(|c| matches!(c, 'a'..='f' | 'A'..='F')) {
+        (trimmed, 16)
+    } else {
+        (trimmed, 10)
+    };
+
+    u32::from_str_radix(digits, radix)
+        .with_context(|| format!("Invalid {} value: {}", label, value))
 }
 
 fn read_base_image_metadata(base_image: &Path) -> Result<package::soc::SocMetadata> {
@@ -553,6 +570,144 @@ fn cmd_burn(
     } else {
         log::info!("burn fail {}", ret);
     }
+
+    Ok(())
+}
+
+struct EraseTarget {
+    name: String,
+    addr: u32,
+    size: u32,
+}
+
+fn resolve_erase_targets(
+    base_image: &Option<std::path::PathBuf>,
+    partitions: &[String],
+    addr: &Option<String>,
+    size: &Option<String>,
+) -> Result<Vec<EraseTarget>> {
+    let mut targets = Vec::new();
+
+    if addr.is_some() || size.is_some() {
+        let addr = addr
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--addr and --size must be provided together"))?;
+        let size = size
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--addr and --size must be provided together"))?;
+        targets.push(EraseTarget {
+            name: "custom".to_string(),
+            addr: parse_u32_arg(addr, "addr")?,
+            size: parse_u32_arg(size, "size")?,
+        });
+    }
+
+    if !partitions.is_empty() {
+        let base_path = base_image
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--base-image is required with --partition"))?;
+        let part_map = package::soc::read_package_partitions(base_path)?;
+        if part_map.partitions.is_empty() {
+            bail!(
+                "No erasable partitions found in {}; use --addr and --size instead",
+                base_path.display()
+            );
+        }
+
+        for name in partitions {
+            let part = part_map.find(name).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Unknown partition '{}'. Available: {}",
+                    name,
+                    part_map.available_names().join(", ")
+                )
+            })?;
+            targets.push(EraseTarget {
+                name: part.name.clone(),
+                addr: part.addr,
+                size: part.size,
+            });
+        }
+    }
+
+    if targets.is_empty() {
+        bail!("Nothing to erase; specify --partition or --addr/--size");
+    }
+
+    Ok(targets)
+}
+
+fn cmd_erase(
+    base_image: &Option<std::path::PathBuf>,
+    partitions: &[String],
+    addr: &Option<String>,
+    size: &Option<String>,
+    port: &str,
+    port_type_str: &str,
+    chip: &Option<String>,
+) -> Result<()> {
+    let targets = resolve_erase_targets(base_image, partitions, addr, size)?;
+
+    let package_info = base_image
+        .as_deref()
+        .map(|path| package::soc::parse_package(path, false))
+        .transpose()?;
+    let chip_name = chip
+        .as_deref()
+        .or_else(|| {
+            package_info.as_ref().and_then(|pkg| {
+                if pkg.chip == package::binpkg::UNKNOWN_CHIP {
+                    None
+                } else {
+                    Some(pkg.chip.as_str())
+                }
+            })
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("Unable to determine chip type; specify --chip or pass --base-image")
+        })?;
+    let agent_br = package_info
+        .as_ref()
+        .and_then(|pkg| pkg.force_br)
+        .unwrap_or(921600);
+
+    for target in &targets {
+        log::info!(
+            "Erase target {} addr=0x{:X} size=0x{:X}",
+            target.name,
+            target.addr,
+            target.size
+        );
+    }
+
+    let port_type = parse_port_type(port_type_str);
+    let port_name = resolve_port(port, BOOT_VID, BOOT_PID, &[])?;
+    log::info!("Select {}", port_name);
+
+    let mut burncom = open_port(&port_name, port_type)?;
+    let port = burncom.as_mut();
+
+    log::info!("Go   Sync");
+    burn_sync(port, SyncType::DlBoot, 2)?;
+    log::info!("Done Sync");
+
+    log::info!("Go   AgentBoot download (baud={})", agent_br);
+    let ag = load_agentboot(chip_name, port_type)?;
+    burn_agboot(port, ag, agent_br)?;
+    log::info!("Done AgentBoot download");
+
+    for target in &targets {
+        log::info!("Go   Erase {}", target.name);
+        let ret = erase_flash_range(port, target.addr, target.size, &target.name)?;
+        if ret != 0 {
+            bail!("erase {} failed ({})", target.name, ret);
+        }
+        log::info!("Done Erase {}", target.name);
+    }
+
+    let reset_ret = sys_reset(port)?;
+    log::info!("sys reset {}", reset_ret);
+    log::info!("erase ok");
 
     Ok(())
 }
@@ -1235,6 +1390,17 @@ fn main() -> Result<()> {
                 )
             };
             cmd_burn(file, port, port_type, chip, do_bl, do_ap, do_cp, do_script)?;
+        }
+        Commands::Erase {
+            base_image,
+            partition,
+            addr,
+            size,
+            port,
+            port_type,
+            chip,
+        } => {
+            cmd_erase(base_image, partition, addr, size, port, port_type, chip)?;
         }
         Commands::Dev {
             paths,

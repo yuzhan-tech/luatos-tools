@@ -225,6 +225,66 @@ pub fn burn_img(
     Ok(ret)
 }
 
+/// Erase an AP flash range through the LPC agent.
+///
+/// The public erase address is the raw non-XIP flash address used by
+/// FlashToolCLI's `flasherase` command. The LPC command itself expects the AP
+/// flash/XIP address, so raw addresses below 0x800000 are biased before being
+/// sent. The official reverse implementation erases in 0x400-byte chunks.
+pub fn erase_flash_range(
+    port: &mut dyn SerialPort,
+    addr: u32,
+    size: u32,
+    tag: &str,
+) -> Result<i32> {
+    if size == 0 {
+        bail!("erase size must be greater than zero for {}", tag);
+    }
+
+    let mut lpc_addr = if addr < 0x800000 {
+        addr + 0x800000
+    } else {
+        addr
+    };
+    let mut remain = size;
+
+    log::info!(
+        "erase {} raw=0x{:X} lpc=0x{:X} size=0x{:X}",
+        tag,
+        addr,
+        lpc_addr,
+        size
+    );
+
+    burn_sync(port, SyncType::Lpc, 2)?;
+
+    let pb = ProgressBar::new(size as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template(&format!(
+                "  {{bar:40.cyan/blue}} {{pos:>7}}/{{len:7}} erase {}",
+                tag
+            ))
+            .unwrap()
+            .progress_chars("##-"),
+    );
+
+    while remain > 0 {
+        let chunk = remain.min(0x400);
+        let ret = lpc_flash_erase(port, lpc_addr, chunk)?;
+        if ret != 0 {
+            pb.abandon_with_message(format!("erase {} FAILED", tag));
+            return Ok(ret);
+        }
+        lpc_addr = lpc_addr.saturating_add(chunk);
+        remain -= chunk;
+        pb.set_position((size - remain) as u64);
+    }
+
+    pb.finish_with_message(format!("erase {} done", tag));
+    Ok(0)
+}
+
 /// Reset the device via LPC command.
 pub fn sys_reset(port: &mut dyn SerialPort) -> Result<i32> {
     burn_sync(port, SyncType::Lpc, 2)?;

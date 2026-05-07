@@ -83,6 +83,21 @@ luatos-tools burn firmware.soc --only script
 luatos-tools burn firmware.soc --only bl,ap
 ```
 
+### `erase` — wipe flash partitions
+
+Erase named partitions from a base SOC/binpkg:
+
+```bash
+luatos-tools erase -i firmware.soc --partition kv
+luatos-tools erase -i firmware.soc --partition fs,platconfig
+```
+
+Or erase an explicit raw flash range:
+
+```bash
+luatos-tools erase --chip ec618 --addr 0x3cc000 --size 0x10000
+```
+
 ### `logs` — capture serial logs
 
 ```bash

@@ -89,6 +89,37 @@ pub enum Commands {
         only: Vec<String>,
     },
 
+    /// Erase flash partitions or an explicit flash range
+    Erase {
+        /// Base SOC/binpkg image for chip and named partition lookup
+        #[arg(short = 'i', long)]
+        base_image: Option<PathBuf>,
+
+        /// Named partitions to erase (comma-separated: fs,kv,platconfig)
+        #[arg(long, value_delimiter = ',')]
+        partition: Vec<String>,
+
+        /// Raw flash erase start address, e.g. 0x3cc000
+        #[arg(long)]
+        addr: Option<String>,
+
+        /// Erase size in bytes, e.g. 0x10000
+        #[arg(long)]
+        size: Option<String>,
+
+        /// Serial port (or "auto" for auto-detection)
+        #[arg(short, long, default_value = "auto")]
+        port: String,
+
+        /// Port type: usb or uart
+        #[arg(short = 't', long, default_value = "usb")]
+        port_type: String,
+
+        /// Chip name for agent boot selection (e.g. ec618, ec718m)
+        #[arg(short, long)]
+        chip: Option<String>,
+    },
+
     /// Capture device serial logs
     Logs {
         /// Serial port (or "auto" for auto-detection)

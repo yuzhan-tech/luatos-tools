@@ -83,6 +83,21 @@ luatos-tools burn firmware.soc --only script
 luatos-tools burn firmware.soc --only bl,ap
 ```
 
+### `erase` — 擦除 Flash 分区
+
+根据基础 SOC/binpkg 擦除命名分区：
+
+```bash
+luatos-tools erase -i firmware.soc --partition kv
+luatos-tools erase -i firmware.soc --partition fs,platconfig
+```
+
+也可以擦除指定原始 Flash 地址范围：
+
+```bash
+luatos-tools erase --chip ec618 --addr 0x3cc000 --size 0x10000
+```
+
 ### `logs` — 串口日志
 
 ```bash
