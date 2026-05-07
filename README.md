@@ -9,8 +9,7 @@ A CLI for building, flashing, and debugging LuatOS firmware on EC618 / EC7xx mod
 ### macOS / Linux (Homebrew)
 
 ```bash
-brew tap yuzhan-tech/tap
-brew install luatos-tools
+brew install yuzhan-tech/tap/luatos-tools
 ```
 
 ### Windows
