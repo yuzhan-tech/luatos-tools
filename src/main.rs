@@ -1421,7 +1421,34 @@ fn main() -> Result<()> {
         Commands::Monitor { port, baud, stream } => {
             cmd_monitor(port, *baud, *stream, cli.debug)?;
         }
+        Commands::Reboot { port } => {
+            cmd_reboot(port)?;
+        }
     }
 
+    Ok(())
+}
+
+/// Reboot the module normally by sending the diag reboot frame over the log COM
+/// (same effect as Dev mode's Ctrl-R). Lets the device restart without a full
+/// reflash, so a fresh boot can be observed.
+fn cmd_reboot(port: &str) -> Result<()> {
+    use std::time::Duration;
+
+    let port_name = resolve_port(
+        port,
+        LOG_VID,
+        LOG_PID,
+        &[LOG_COMM_INTERFACE, LOG_DATA_INTERFACE],
+    )?;
+    log::info!("Select {}", port_name);
+
+    let mut logcom = serialport::new(&port_name, 115200)
+        .timeout(Duration::from_millis(500))
+        .open()
+        .with_context(|| format!("Failed to open log port {}", port_name))?;
+
+    serial::detect::reboot_on_port(logcom.as_mut())?;
+    log::info!("reboot sent on {}", port_name);
     Ok(())
 }

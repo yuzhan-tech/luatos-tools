@@ -171,4 +171,11 @@ pub enum Commands {
         #[arg(short, long)]
         stream: bool,
     },
+
+    /// Reboot the module normally (diag reboot over the log port, like Dev's Ctrl-R)
+    Reboot {
+        /// Serial port (or "auto" for auto-detection)
+        #[arg(short, long, default_value = "auto")]
+        port: String,
+    },
 }
