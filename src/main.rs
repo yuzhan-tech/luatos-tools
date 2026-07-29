@@ -5,6 +5,7 @@ mod lua;
 mod luadb;
 mod package;
 mod serial;
+mod unilog;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -1349,6 +1350,37 @@ fn main() -> Result<()> {
         }
         Commands::Reboot { port } => {
             cmd_reboot(port)?;
+        }
+        Commands::Unilog {
+            port,
+            comdb,
+            base_image,
+            raw,
+            phy,
+            owner,
+            module,
+            sub,
+            level,
+            file,
+            out,
+            append,
+            version_check,
+        } => {
+            unilog::run(unilog::UnilogArgs {
+                port: port.clone(),
+                comdb: comdb.clone(),
+                base_image: base_image.clone(),
+                raw: *raw,
+                phy: *phy,
+                owner: owner.clone(),
+                module: module.clone(),
+                sub: sub.clone(),
+                level: level.clone(),
+                file: file.clone(),
+                out: out.clone(),
+                append: *append,
+                version_check: *version_check,
+            })?;
         }
     }
 

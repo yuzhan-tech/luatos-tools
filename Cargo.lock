@@ -330,6 +330,7 @@ version = "0.1.0"
 source = "git+https://github.com/yuzhan-tech/ectool.git?tag=v0.1.0#d8b472126a9a070439df6b3c5677071a01b0c026"
 dependencies = [
  "anyhow",
+ "chrono",
  "crc32fast",
  "hex",
  "log",

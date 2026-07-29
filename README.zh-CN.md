@@ -110,6 +110,29 @@ luatos-tools logs
 luatos-tools logs --hex
 ```
 
+### `unilog` — EigenComm 底层日志
+
+使用 SDK 生成的 `comdb.txt` 解码 UniLog 二进制日志，也可以直接从
+LuatOS SOC 镜像中读取该文件：
+
+```bash
+luatos-tools unilog --comdb comdb.txt
+luatos-tools unilog -i firmware.soc
+```
+
+实时模式会自动识别 LuatOS USB 接口 5。可以保存原始数据供离线回放，
+也可以在没有字典时查看原始记录：
+
+```bash
+luatos-tools unilog -i firmware.soc --out capture.bin
+luatos-tools unilog --file capture.bin -i firmware.soc
+luatos-tools unilog --raw
+```
+
+可使用 `--owner`、`--module`、`--sub` 和 `--level` 过滤解码后的记录。
+这是 EigenComm 底层 UniLog 通道；`logs`、`monitor` 和 `dev` 仍使用独立的
+LuatOS 格式化日志通道。
+
 ### `monitor` — 设备状态
 
 实时面板：

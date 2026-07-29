@@ -110,6 +110,29 @@ Print raw frames as hex:
 luatos-tools logs --hex
 ```
 
+### `unilog` — low-level EigenComm logs
+
+Decode the binary UniLog stream with an SDK `comdb.txt`, or load that file
+directly from a LuatOS SOC image:
+
+```bash
+luatos-tools unilog --comdb comdb.txt
+luatos-tools unilog -i firmware.soc
+```
+
+The live UniLog port is auto-detected on LuatOS USB interface 5. Capture raw
+bytes for later replay, or inspect records without a dictionary:
+
+```bash
+luatos-tools unilog -i firmware.soc --out capture.bin
+luatos-tools unilog --file capture.bin -i firmware.soc
+luatos-tools unilog --raw
+```
+
+Use `--owner`, `--module`, `--sub`, and `--level` to filter decoded records.
+This is the low-level EigenComm UniLog channel; `logs`, `monitor`, and `dev`
+continue to use the separate LuatOS formatted-log channel.
+
 ### `monitor` — device status
 
 Live dashboard:

@@ -178,4 +178,99 @@ pub enum Commands {
         #[arg(short, long, default_value = "auto")]
         port: String,
     },
+
+    /// Capture, replay, and decode the low-level EigenComm UniLog stream
+    Unilog {
+        /// Serial port (or "auto" for LuatOS USB interface 5)
+        #[arg(short, long, default_value = "auto")]
+        port: String,
+
+        /// comdb.txt produced by the EC7xx SDK PrePass tool
+        #[arg(short, long)]
+        comdb: Option<PathBuf>,
+
+        /// LuatOS SOC image or extracted directory containing comdb.txt
+        #[arg(short = 'i', long)]
+        base_image: Option<PathBuf>,
+
+        /// Print raw records without a comdb
+        #[arg(long)]
+        raw: bool,
+
+        /// Show undecodable PHY records
+        #[arg(long)]
+        phy: bool,
+
+        /// Filter owners by name substring or numeric ID
+        #[arg(long, value_delimiter = ',')]
+        owner: Vec<String>,
+
+        /// Filter modules by name substring or numeric ID
+        #[arg(long, value_delimiter = ',')]
+        module: Vec<String>,
+
+        /// Filter sites by name substring or numeric ID
+        #[arg(long, value_delimiter = ',')]
+        sub: Vec<String>,
+
+        /// Filter levels (DBG, INF, VAL, SIG, WRN, ERR)
+        #[arg(long, value_delimiter = ',')]
+        level: Vec<String>,
+
+        /// Replay a raw capture or EPAT RecvDump file
+        #[arg(short = 'f', long)]
+        file: Option<PathBuf>,
+
+        /// Save raw captured bytes for later replay
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+
+        /// Append to --out instead of refusing an existing file
+        #[arg(long)]
+        append: bool,
+
+        /// Compare the device log version with the selected comdb
+        #[arg(long)]
+        version_check: bool,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_unilog_adapter_options() {
+        let cli = Cli::try_parse_from([
+            "luatos-tools",
+            "unilog",
+            "--base-image",
+            "firmware.soc",
+            "--owner",
+            "RRC,3",
+            "--level",
+            "WRN,ERR",
+            "--out",
+            "capture.bin",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Unilog {
+                port,
+                base_image,
+                owner,
+                level,
+                out,
+                ..
+            } => {
+                assert_eq!(port, "auto");
+                assert_eq!(base_image, Some(PathBuf::from("firmware.soc")));
+                assert_eq!(owner, ["RRC", "3"]);
+                assert_eq!(level, ["WRN", "ERR"]);
+                assert_eq!(out, Some(PathBuf::from("capture.bin")));
+            }
+            _ => panic!("expected unilog command"),
+        }
+    }
 }
