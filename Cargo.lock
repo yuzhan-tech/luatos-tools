@@ -325,6 +325,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ectool"
+version = "0.1.0"
+source = "git+https://github.com/yuzhan-tech/ectool.git?tag=v0.1.0#d8b472126a9a070439df6b3c5677071a01b0c026"
+dependencies = [
+ "anyhow",
+ "crc32fast",
+ "hex",
+ "log",
+ "serialport",
+ "sha2",
+]
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -631,10 +644,9 @@ dependencies = [
  "cc",
  "chrono",
  "clap",
- "crc32fast",
  "crossterm",
+ "ectool",
  "env_logger",
- "hex",
  "indicatif",
  "log",
  "md5",

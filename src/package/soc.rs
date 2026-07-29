@@ -1,9 +1,8 @@
 use anyhow::{bail, Context, Result};
-use sha2::{Digest, Sha256};
+use ectool_core::{parse_binpkg, rehash_entry, serialize_binpkg, BinpkgResult};
 use std::fs;
 use std::path::Path;
 
-use super::binpkg::{parse_binpkg, rehash_entry, serialize_binpkg, BinpkgEntry, BinpkgResult};
 use super::info::{parse_info_json, InfoJson};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,10 +143,32 @@ fn merge_partitions(dst: &mut FlashPartitions, src: FlashPartitions) {
     }
 }
 
+/// LuatOS script image stored alongside the generic EigenComm package.
+#[derive(Debug)]
+pub struct LuatScriptImage {
+    pub address: u32,
+    pub data: Option<Vec<u8>>,
+}
+
+/// A generic EigenComm package plus LuatOS-owned wrapper metadata.
+#[derive(Debug)]
+pub struct LuatPackage {
+    pub binpkg: BinpkgResult,
+    pub force_br: Option<u32>,
+    pub script: Option<LuatScriptImage>,
+}
+
+impl LuatPackage {
+    pub fn product_name(&self) -> Option<&str> {
+        (self.binpkg.product_name != ectool_core::package::binpkg::UNKNOWN_PRODUCT)
+            .then_some(self.binpkg.product_name.as_str())
+    }
+}
+
 /// Parse a SOC file (7z archive) containing binpkg, info.json, and optional script.bin.
 ///
 /// If `keep_data` is true, image data is kept in memory for burning.
-pub fn parse_soc(path: &Path, keep_data: bool) -> Result<BinpkgResult> {
+pub fn parse_soc(path: &Path, keep_data: bool) -> Result<LuatPackage> {
     let tmpdir = tempfile::tempdir().context("Failed to create temp directory")?;
     let tmppath = tmpdir.path();
 
@@ -175,63 +196,38 @@ pub fn parse_soc(path: &Path, keep_data: bool) -> Result<BinpkgResult> {
 
     let binpkg_bytes =
         binpkg_data.ok_or_else(|| anyhow::anyhow!("No .binpkg file found in SOC archive"))?;
-    let mut result = parse_binpkg(&binpkg_bytes, keep_data)?;
+    let mut binpkg = parse_binpkg(&binpkg_bytes, keep_data)?;
     let info = info_json_data
         .as_ref()
         .and_then(|bytes| parse_info_json(bytes).ok());
 
-    if result.chip == super::binpkg::UNKNOWN_CHIP {
+    if binpkg.product_name == ectool_core::package::binpkg::UNKNOWN_PRODUCT {
         if let Some(info_chip) = info.as_ref().and_then(chip_from_info_json) {
-            result.chip = info_chip;
+            binpkg.product_name = info_chip;
         }
     }
 
-    // Handle script.bin
-    if let Some((_fname, sdata)) = script_data {
-        let hash = hex::encode(Sha256::digest(&sdata));
-        let mut script_entry = BinpkgEntry {
-            name: "script".to_string(),
-            addr: 0,
-            flash_size: 0,
-            offset: 0,
-            image_size: sdata.len() as u32,
-            hash,
-            image_type: "AP".to_string(),
-            vt: 0,
-            vtsize: 0,
-            rsvd: 0,
-            pdata: 0,
-            data: if keep_data { Some(sdata) } else { None },
-        };
+    let script_address = info
+        .as_ref()
+        .and_then(|info| info.download.as_ref())
+        .and_then(|download| download.script_addr.as_deref())
+        .and_then(|address| u32::from_str_radix(address, 16).ok())
+        .unwrap_or(0);
+    let script = script_data.map(|(_name, data)| LuatScriptImage {
+        address: script_address,
+        data: keep_data.then_some(data),
+    });
+    let force_br = info
+        .as_ref()
+        .and_then(|info| info.download.as_ref())
+        .and_then(|download| download.force_br.as_deref())
+        .and_then(|baud| baud.parse::<u32>().ok());
 
-        // Get burn_addr from info.json
-        if let Some(ref info_bytes) = info_json_data {
-            if let Ok(info) = parse_info_json(info_bytes) {
-                if let Some(download) = &info.download {
-                    if let Some(ref script_addr) = download.script_addr {
-                        if let Ok(addr) = u32::from_str_radix(script_addr, 16) {
-                            script_entry.addr = addr;
-                        }
-                    }
-                }
-            }
-        }
-
-        result.entries.push(script_entry);
-    }
-
-    // Read force_br from info.json
-    if let Some(info) = info.as_ref() {
-        if let Some(download) = &info.download {
-            if let Some(ref br) = download.force_br {
-                if let Ok(v) = br.parse::<u32>() {
-                    result.force_br = Some(v);
-                }
-            }
-        }
-    }
-
-    Ok(result)
+    Ok(LuatPackage {
+        binpkg,
+        force_br,
+        script,
+    })
 }
 
 /// Metadata read from a SOC file.
@@ -260,7 +256,7 @@ pub fn read_soc_metadata(path: &Path) -> Result<SocMetadata> {
         if fname.ends_with(".binpkg") {
             let fdata = fs::read(entry.path())?;
             let result = parse_binpkg(&fdata, false)?;
-            chip = Some(result.chip);
+            chip = Some(result.product_name);
             break;
         }
     }
@@ -269,7 +265,7 @@ pub fn read_soc_metadata(path: &Path) -> Result<SocMetadata> {
     let info_bytes = fs::read(&info_path).context("No info.json in SOC")?;
     let info = parse_info_json(&info_bytes)?;
     let chip = chip
-        .filter(|chip| chip != super::binpkg::UNKNOWN_CHIP)
+        .filter(|chip| chip != ectool_core::package::binpkg::UNKNOWN_PRODUCT)
         .or_else(|| chip_from_info_json(&info))
         .ok_or_else(|| {
             anyhow::anyhow!("Unable to determine chip type from SOC binpkg or info.json")
@@ -306,7 +302,7 @@ pub fn read_soc_metadata(path: &Path) -> Result<SocMetadata> {
 }
 
 /// Parse either a .soc or .binpkg file based on extension.
-pub fn parse_package(path: &Path, keep_data: bool) -> Result<BinpkgResult> {
+pub fn parse_package(path: &Path, keep_data: bool) -> Result<LuatPackage> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     match ext {
@@ -314,7 +310,11 @@ pub fn parse_package(path: &Path, keep_data: bool) -> Result<BinpkgResult> {
         "binpkg" => {
             let fdata = fs::read(path)
                 .with_context(|| format!("Failed to read binpkg: {}", path.display()))?;
-            parse_binpkg(&fdata, keep_data)
+            Ok(LuatPackage {
+                binpkg: parse_binpkg(&fdata, keep_data)?,
+                force_br: None,
+                script: None,
+            })
         }
         _ => bail!("Unknown package format: {} (expected .soc or .binpkg)", ext),
     }
@@ -332,7 +332,7 @@ pub fn read_package_partitions(path: &Path) -> Result<FlashPartitions> {
             .with_context(|| format!("Failed to read package: {}", path.display()))?;
         let parsed = parse_binpkg(&fdata, false)?;
         let mut parts = FlashPartitions::default();
-        if parsed.chip.to_ascii_uppercase().contains("EC618") {
+        if parsed.product_name.to_ascii_uppercase().contains("EC618") {
             add_ec618_partition_defaults(&mut parts, None);
         }
         return Ok(parts);
@@ -355,8 +355,8 @@ pub fn read_package_partitions(path: &Path) -> Result<FlashPartitions> {
         if fname.ends_with(".binpkg") {
             let fdata = fs::read(&fpath)?;
             let parsed = parse_binpkg(&fdata, false)?;
-            if parsed.chip != super::binpkg::UNKNOWN_CHIP {
-                chip = Some(parsed.chip);
+            if parsed.product_name != ectool_core::package::binpkg::UNKNOWN_PRODUCT {
+                chip = Some(parsed.product_name);
             }
         } else if fname == "info.json" {
             let info = parse_info_json(&fs::read(&fpath)?)?;

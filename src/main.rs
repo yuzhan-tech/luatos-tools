@@ -1,27 +1,27 @@
+mod agentboot;
 mod cli;
-mod flash;
 mod logs;
 mod lua;
 mod luadb;
 mod package;
 mod serial;
-mod util;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use ectool_core::{
+    open_port, plan_binpkg_images, resolve_transfer_config, AgentBootConfig, BinpkgResult,
+    FlashSession, FlashStorage, ImageKind, ImageTarget, PackageSelection, PortType,
+    TransferOverrides,
+};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
 use std::path::Path;
 
+use agentboot::load_agentboot;
 use cli::{Cli, Commands};
-use flash::burn::{burn_agboot, burn_img, erase_flash_range, load_agentboot, sys_reset};
-use flash::consts::*;
-use flash::sync::burn_sync;
 use lua::compiler::{compile_lua, init_lua_helper_cache};
 use luadb::pack::{pack_luadb, LuadbEntry};
-use serial::detect::{
-    resolve_port, BOOT_PID, BOOT_VID, LOG_COMM_INTERFACE, LOG_DATA_INTERFACE, LOG_PID, LOG_VID,
-};
-use serial::port::{open_port, PortType};
+use serial::detect::{resolve_boot_port, resolve_log_port};
 
 /// Add a single file to the entry list, compiling .lua files.
 fn add_file_entry(
@@ -234,6 +234,88 @@ fn parse_port_type(s: &str) -> PortType {
     }
 }
 
+fn progress_bar(total: u64, label: &str) -> ProgressBar {
+    let progress = ProgressBar::new(total);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template(&format!(
+                "  {{bar:40.cyan/blue}} {{percent:>3}}% {{pos:>7}}/{{len:7}} {label}"
+            ))
+            .expect("static progress template is valid")
+            .progress_chars("##-"),
+    );
+    progress
+}
+
+fn start_flash_session(
+    port_name: &str,
+    port_type: PortType,
+    product_name: &str,
+    package: Option<&BinpkgResult>,
+    force_br: Option<u32>,
+) -> Result<FlashSession> {
+    let resolved = resolve_transfer_config(
+        package,
+        port_type,
+        TransferOverrides {
+            // LuatOS info.json metadata is an application-owned override.
+            agent_baud: force_br,
+            ..TransferOverrides::default()
+        },
+    )?;
+    let agent = load_agentboot(product_name, port_type)?;
+    let port = open_port(port_name, port_type)?;
+
+    log::info!(
+        "Loading AgentBoot at {} baud (pullup_qspi={}, dribble_download={})",
+        resolved.agent_baud,
+        resolved.pullup_qspi,
+        resolved.transfer.dribble_download
+    );
+    FlashSession::start(
+        port,
+        AgentBootConfig {
+            data: agent,
+            baud: resolved.agent_baud,
+            pullup_qspi: resolved.pullup_qspi,
+        },
+        resolved.transfer,
+    )
+}
+
+fn flash_with_progress(
+    session: &mut FlashSession,
+    target: ImageTarget<'_>,
+    data: &[u8],
+) -> Result<()> {
+    let progress = progress_bar(data.len() as u64, target.tag);
+    let mut update = |completed, _total| progress.set_position(completed);
+    if let Err(error) = session.flash_image(target, data, Some(&mut update)) {
+        progress.abandon_with_message(format!("{} FAILED", target.tag));
+        return Err(error);
+    }
+    progress.finish_with_message(format!("{} done", target.tag));
+    Ok(())
+}
+
+fn luatos_script_target(address: u32) -> Result<ImageTarget<'static>> {
+    // Preserve the LuatOS FlexFile convention used by the existing tool: the
+    // script address is sent in AP-flash XIP form.
+    let address = if address < 0x0080_0000 {
+        address
+            .checked_add(0x0080_0000)
+            .context("LuatOS script address overflow while applying XIP bias")?
+    } else {
+        address
+    };
+    Ok(ImageTarget {
+        image_type: ImageKind::FlexFile,
+        storage: FlashStorage::ApFlash,
+        address,
+        tag: "SCRIPT",
+    })
+}
+
 fn normalize_lua_bitw(lua_bitw: u32) -> Result<u32> {
     match lua_bitw {
         32 | 64 => Ok(lua_bitw),
@@ -314,52 +396,33 @@ fn cmd_script(
     }
 
     if burn {
+        let base_path = base_image
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--base-image is required when using --burn"))?;
         let meta = base_meta
             .ok_or_else(|| anyhow::anyhow!("--base-image is required when using --burn"))?;
+        let base_package = package::soc::parse_package(base_path, false)?;
 
-        let mut burn_addr = meta.script_addr;
-        if burn_addr < 0x800000 {
-            burn_addr += 0x800000;
-        }
-        let agent_br = meta.force_br.unwrap_or(921600);
         log::info!(
-            "Burn addr=0x{:X}, chip={}, agent_br={}",
-            burn_addr,
-            meta.chip,
-            agent_br
+            "Burn script addr=0x{:X}, package product={}",
+            meta.script_addr,
+            meta.chip
         );
 
         let port_type = parse_port_type(port_type_str);
-        let port_name = resolve_port(port, BOOT_VID, BOOT_PID, &[])?;
-        let mut burncom = open_port(&port_name, port_type)?;
-        let port = burncom.as_mut();
-
-        log::info!("Go   Sync");
-        burn_sync(port, SyncType::DlBoot, 2)?;
-        log::info!("Done Sync");
-
-        let ag = load_agentboot(&meta.chip, port_type)?;
-        burn_agboot(port, ag, agent_br)?;
-
-        log::info!("Go   Script download");
-        let ret = burn_img(
-            port,
-            &bin,
-            BurnImageType::FlexFile,
-            STYPE_AP_FLASH,
-            burn_addr,
-            "SCRIPT",
-            None,
+        let port_name = resolve_boot_port(port)?;
+        let mut session = start_flash_session(
+            &port_name,
+            port_type,
+            &meta.chip,
+            Some(&base_package.binpkg),
+            meta.force_br,
         )?;
-
-        let reset_ret = sys_reset(port)?;
-        log::info!("sys reset {}", reset_ret);
-
-        if ret == 0 {
-            log::info!("burn script ok");
-        } else {
-            bail!("burn script failed ({})", ret);
-        }
+        flash_with_progress(&mut session, luatos_script_target(meta.script_addr)?, &bin)?;
+        session
+            .finish_reset()
+            .context("Script was written, but the final device reset failed")?;
+        log::info!("burn script ok");
     }
 
     Ok(())
@@ -395,182 +458,87 @@ fn cmd_burn(
     do_burn_cp: bool,
     do_burn_script: bool,
 ) -> Result<()> {
-    let jdata = package::soc::parse_package(file, true)?;
+    let mut package = package::soc::parse_package(file, true)?;
+    if package.product_name().is_none() {
+        if let Some(chip) = chip.as_deref() {
+            // Legacy binpkg headers may not carry a product. Give ectool's
+            // generic planner the same explicit product selected for AgentBoot.
+            package.binpkg.product_name = chip.to_string();
+        }
+    }
     let chip_name = chip
         .as_deref()
-        .or_else(|| {
-            if jdata.chip == package::binpkg::UNKNOWN_CHIP {
-                None
-            } else {
-                Some(jdata.chip.as_str())
-            }
-        })
+        .or_else(|| package.product_name())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Unable to determine chip type from package; specify it manually with -c <chip>"
             )
         })?;
-    let is_ec7xx = chip_name.to_uppercase().contains("EC7");
 
-    log::info!(
-        "Files: {:?}",
-        jdata.entries.iter().map(|e| &e.name).collect::<Vec<_>>()
-    );
-    log::info!("Chip: {}", chip_name);
+    let mut files = package
+        .binpkg
+        .entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect::<Vec<_>>();
+    if package.script.is_some() {
+        files.push("script".to_string());
+    }
+    log::info!("Files: {:?}", files);
+    log::info!("Package product: {}", chip_name);
+
+    let generic_selection = PackageSelection {
+        bootloader: do_burn_bl,
+        ap: do_burn_ap,
+        cp: do_burn_cp,
+    };
+    let generic_plan = if generic_selection.is_empty() {
+        Vec::new()
+    } else {
+        plan_binpkg_images(&package.binpkg, generic_selection)?
+    };
+    let script = if do_burn_script {
+        package.script.as_ref()
+    } else {
+        None
+    };
+    if generic_plan.is_empty() && script.is_none() {
+        bail!("Package contains no selected generic or LuatOS script images");
+    }
 
     let port_type = parse_port_type(port_type_str);
-    let port_name = resolve_port(port, BOOT_VID, BOOT_PID, &[])?;
+    let port_name = resolve_boot_port(port)?;
     log::info!("Select {}", port_name);
+    let mut session = start_flash_session(
+        &port_name,
+        port_type,
+        chip_name,
+        Some(&package.binpkg),
+        package.force_br,
+    )?;
 
-    let mut burncom = open_port(&port_name, port_type)?;
-    let port = burncom.as_mut();
-
-    // Initial DLBOOT sync
-    log::info!("Go   Sync");
-    burn_sync(port, SyncType::DlBoot, 2)?;
-    log::info!("Done Sync");
-
-    // Agent boot is required for all burn operations (BL/AP/CP/script all use LPC via agentboot)
-    let agent_br = jdata.force_br.unwrap_or(921600);
-    log::info!("Go   AgentBoot download (baud={})", agent_br);
-    let ag = load_agentboot(chip_name, port_type)?;
-    burn_agboot(port, ag, agent_br)?;
-    log::info!("Done AgentBoot download");
-
-    // Identify partitions by image_type
-    let bl_idx = jdata
-        .entries
-        .iter()
-        .position(|e| e.image_type == "BL" && e.data.is_some());
-    let ap_idx = jdata
-        .entries
-        .iter()
-        .position(|e| e.image_type == "AP" && e.name != "script" && e.data.is_some());
-    let cp_idx = jdata
-        .entries
-        .iter()
-        .position(|e| e.image_type == "CP" && e.data.is_some());
-
-    let mut ret = 0;
-
-    // Burn BL
-    if let Some(idx) = bl_idx {
-        if do_burn_bl {
-            let entry = &jdata.entries[idx];
-            log::info!("Go   BL download");
-            ret = burn_img(
-                port,
-                entry.data.as_ref().unwrap(),
-                BurnImageType::Bootloader,
-                STYPE_AP_FLASH,
-                0,
-                "BL",
-                None,
-            )?;
-            if ret != 0 {
-                bail!("burn_img BootLoader failed");
-            }
-            log::info!("Done BL download");
-        }
+    for image in generic_plan {
+        let data = image
+            .entry
+            .data
+            .as_deref()
+            .expect("ectool package planning validates retained image data");
+        flash_with_progress(&mut session, image.target, data)
+            .with_context(|| format!("Failed to flash {}", image.entry.name))?;
     }
 
-    // Burn AP
-    if let Some(idx) = ap_idx {
-        if do_burn_ap {
-            let entry = &jdata.entries[idx];
-            log::info!("Go   AP download");
-            let mut ap_addr = entry.addr;
-            if ap_addr >= 0x800000 {
-                ap_addr -= 0x800000;
-            }
-            ret = burn_img(
-                port,
-                entry.data.as_ref().unwrap(),
-                BurnImageType::Ap,
-                STYPE_AP_FLASH,
-                ap_addr,
-                "AP",
-                None,
-            )?;
-            if ret != 0 {
-                bail!("burn_img AP failed");
-            }
-            log::info!("Done AP download");
-        }
+    if let Some(script) = script {
+        let data = script
+            .data
+            .as_deref()
+            .context("LuatOS script data was not retained")?;
+        flash_with_progress(&mut session, luatos_script_target(script.address)?, data)?;
     }
 
-    // Burn CP
-    if let Some(idx) = cp_idx {
-        if do_burn_cp {
-            let entry = &jdata.entries[idx];
-            log::info!("Go   CP download");
-            if is_ec7xx {
-                let mut cp_addr = entry.addr;
-                if cp_addr >= 0x800000 {
-                    cp_addr -= 0x800000;
-                }
-                ret = burn_img(
-                    port,
-                    entry.data.as_ref().unwrap(),
-                    BurnImageType::Cp,
-                    STYPE_AP_FLASH,
-                    cp_addr,
-                    "CP",
-                    None,
-                )?;
-            } else {
-                ret = burn_img(
-                    port,
-                    entry.data.as_ref().unwrap(),
-                    BurnImageType::Cp,
-                    STYPE_CP_FLASH,
-                    0,
-                    "CP",
-                    None,
-                )?;
-            }
-            if ret != 0 {
-                bail!("burn_img CP failed");
-            }
-            log::info!("Done CP download");
-        }
-    }
-
-    // Burn Script
-    if let Some(script_entry) = jdata.find_entry("script") {
-        if do_burn_script {
-            if let Some(ref data) = script_entry.data {
-                log::info!("Go   Script download");
-                let mut burn_addr = script_entry.addr;
-                if burn_addr < 0x800000 {
-                    burn_addr += 0x800000;
-                }
-                ret = burn_img(
-                    port,
-                    data,
-                    BurnImageType::FlexFile,
-                    STYPE_AP_FLASH,
-                    burn_addr,
-                    "SCRIPT",
-                    None,
-                )?;
-                if ret != 0 {
-                    bail!("burn_img SCRIPT failed");
-                }
-                log::info!("Done Script download");
-            }
-        }
-    }
-
-    let reset_ret = sys_reset(port)?;
-    log::info!("sys reset {}", reset_ret);
-
-    if ret == 0 {
-        log::info!("burn ok");
-    } else {
-        log::info!("burn fail {}", ret);
-    }
-
+    session
+        .finish_reset()
+        .context("Images were written, but the final device reset failed")?;
+    log::info!("burn ok");
     Ok(())
 }
 
@@ -654,22 +622,10 @@ fn cmd_erase(
         .transpose()?;
     let chip_name = chip
         .as_deref()
-        .or_else(|| {
-            package_info.as_ref().and_then(|pkg| {
-                if pkg.chip == package::binpkg::UNKNOWN_CHIP {
-                    None
-                } else {
-                    Some(pkg.chip.as_str())
-                }
-            })
-        })
+        .or_else(|| package_info.as_ref().and_then(|pkg| pkg.product_name()))
         .ok_or_else(|| {
             anyhow::anyhow!("Unable to determine chip type; specify --chip or pass --base-image")
         })?;
-    let agent_br = package_info
-        .as_ref()
-        .and_then(|pkg| pkg.force_br)
-        .unwrap_or(921600);
 
     for target in &targets {
         log::info!(
@@ -681,32 +637,32 @@ fn cmd_erase(
     }
 
     let port_type = parse_port_type(port_type_str);
-    let port_name = resolve_port(port, BOOT_VID, BOOT_PID, &[])?;
+    let port_name = resolve_boot_port(port)?;
     log::info!("Select {}", port_name);
-
-    let mut burncom = open_port(&port_name, port_type)?;
-    let port = burncom.as_mut();
-
-    log::info!("Go   Sync");
-    burn_sync(port, SyncType::DlBoot, 2)?;
-    log::info!("Done Sync");
-
-    log::info!("Go   AgentBoot download (baud={})", agent_br);
-    let ag = load_agentboot(chip_name, port_type)?;
-    burn_agboot(port, ag, agent_br)?;
-    log::info!("Done AgentBoot download");
+    let mut session = start_flash_session(
+        &port_name,
+        port_type,
+        chip_name,
+        package_info.as_ref().map(|package| &package.binpkg),
+        package_info.as_ref().and_then(|package| package.force_br),
+    )?;
 
     for target in &targets {
         log::info!("Go   Erase {}", target.name);
-        let ret = erase_flash_range(port, target.addr, target.size, &target.name)?;
-        if ret != 0 {
-            bail!("erase {} failed ({})", target.name, ret);
+        let progress = progress_bar(target.size as u64, &format!("erase {}", target.name));
+        let mut update = |completed, _total| progress.set_position(completed);
+        if let Err(error) = session.erase_with_progress(target.addr, target.size, Some(&mut update))
+        {
+            progress.abandon_with_message(format!("erase {} FAILED", target.name));
+            return Err(error).with_context(|| format!("erase {} failed", target.name));
         }
+        progress.finish_with_message(format!("erase {} done", target.name));
         log::info!("Done Erase {}", target.name);
     }
 
-    let reset_ret = sys_reset(port)?;
-    log::info!("sys reset {}", reset_ret);
+    session
+        .finish_reset()
+        .context("Erase completed, but the final device reset failed")?;
     log::info!("erase ok");
 
     Ok(())
@@ -717,12 +673,7 @@ fn cmd_logs(port: &str, baud: u32) -> Result<()> {
     use std::io::Read;
     use std::time::Duration;
 
-    let port_name = resolve_port(
-        port,
-        LOG_VID,
-        LOG_PID,
-        &[LOG_COMM_INTERFACE, LOG_DATA_INTERFACE],
-    )?;
+    let port_name = resolve_log_port(port)?;
     log::info!("Select {}", port_name);
 
     let mut logcom = serialport::new(&port_name, baud)
@@ -764,12 +715,7 @@ fn cmd_logs_hex(port: &str, baud: u32) -> Result<()> {
     use std::io::Read;
     use std::time::Duration;
 
-    let port_name = resolve_port(
-        port,
-        LOG_VID,
-        LOG_PID,
-        &[LOG_COMM_INTERFACE, LOG_DATA_INTERFACE],
-    )?;
+    let port_name = resolve_log_port(port)?;
     log::info!("Select {}", port_name);
 
     let mut logcom = serialport::new(&port_name, baud)
@@ -818,12 +764,7 @@ fn cmd_monitor(port: &str, baud: u32, stream: bool, debug: bool) -> Result<()> {
     use std::io::Read;
     use std::time::Duration;
 
-    let port_name = resolve_port(
-        port,
-        LOG_VID,
-        LOG_PID,
-        &[LOG_COMM_INTERFACE, LOG_DATA_INTERFACE],
-    )?;
+    let port_name = resolve_log_port(port)?;
     log::info!("Select {}", port_name);
 
     let mut logcom = serialport::new(&port_name, baud)
@@ -1046,9 +987,8 @@ fn dev_cleanup() {
 /// Wait for a serial port, polling keyboard events so Ctrl+C works in raw mode.
 /// Returns Ok(Some(port)) on success, Ok(None) on Ctrl+C, Err on timeout.
 fn wait_for_port_interruptible(
-    vid: u16,
-    pid: u16,
-    interfaces: &[u8],
+    mut find_port: impl FnMut() -> Result<Option<String>>,
+    description: &str,
     timeout_secs: u32,
 ) -> Result<Option<String>> {
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
@@ -1061,7 +1001,7 @@ fn wait_for_port_interruptible(
         timeout_secs * 10
     };
     for _ in 0..max_iterations {
-        if let Some(port) = serial::detect::auto_detect_port(vid, pid, interfaces) {
+        if let Some(port) = find_port()? {
             return Ok(Some(port));
         }
         // Poll keyboard for 100ms (same interval as wait_for_port's sleep)
@@ -1077,9 +1017,8 @@ fn wait_for_port_interruptible(
         }
     }
     anyhow::bail!(
-        "Timeout waiting for USB device {:04X}:{:04X} ({} seconds)",
-        vid,
-        pid,
+        "Timeout waiting for {} ({} seconds)",
+        description,
         timeout_secs
     );
 }
@@ -1096,11 +1035,7 @@ fn cmd_dev(
     use std::time::Duration;
 
     let meta = read_base_image_metadata(base_image)?;
-    let mut burn_addr = meta.script_addr;
-    if burn_addr < 0x800000 {
-        burn_addr += 0x800000;
-    }
-    let agent_br = meta.force_br.unwrap_or(921600);
+    let base_package = package::soc::parse_package(base_image, false)?;
     let port_type = parse_port_type(port_type_str);
     let mut status_parser = logs::status::StatusParser::new();
 
@@ -1112,9 +1047,8 @@ fn cmd_dev(
 
         let log_port_name = if port == "auto" {
             match wait_for_port_interruptible(
-                LOG_VID,
-                LOG_PID,
-                &[LOG_COMM_INTERFACE, LOG_DATA_INTERFACE],
+                serial::detect::find_log_port_now,
+                "LuatOS log port",
                 0,
             )? {
                 Some(p) => p,
@@ -1252,7 +1186,11 @@ fn cmd_dev(
 
         dev_draw_banner(">> Waiting for boot port...", &status_parser.status);
         crossterm::terminal::enable_raw_mode()?;
-        let boot_port_result = wait_for_port_interruptible(BOOT_VID, BOOT_PID, &[], 30);
+        let boot_port_result = wait_for_port_interruptible(
+            || ectool_core::find_download_port_now("auto").map(|port| port.map(|port| port.name)),
+            "EigenComm download port",
+            30,
+        );
         let _ = crossterm::terminal::disable_raw_mode();
         let boot_port_name = match boot_port_result {
             Ok(Some(p)) => p,
@@ -1277,29 +1215,17 @@ fn cmd_dev(
         // --- Burn ---
         dev_draw_banner(">> Downloading...", &status_parser.status);
         let burn_result = (|| -> Result<()> {
-            let mut burncom = open_port(&boot_port_name, port_type)?;
-            let port = burncom.as_mut();
-
-            burn_sync(port, SyncType::DlBoot, 2)?;
-
-            let ag = load_agentboot(&meta.chip, port_type)?;
-            burn_agboot(port, ag, agent_br)?;
-
-            let ret = burn_img(
-                port,
-                &bin,
-                BurnImageType::FlexFile,
-                STYPE_AP_FLASH,
-                burn_addr,
-                "SCRIPT",
-                None,
+            let mut session = start_flash_session(
+                &boot_port_name,
+                port_type,
+                &meta.chip,
+                Some(&base_package.binpkg),
+                meta.force_br,
             )?;
-
-            sys_reset(port)?;
-
-            if ret != 0 {
-                bail!("Burn failed ({})", ret);
-            }
+            flash_with_progress(&mut session, luatos_script_target(meta.script_addr)?, &bin)?;
+            session
+                .finish_reset()
+                .context("Script was written, but the final device reset failed")?;
             Ok(())
         })();
 
@@ -1435,12 +1361,7 @@ fn main() -> Result<()> {
 fn cmd_reboot(port: &str) -> Result<()> {
     use std::time::Duration;
 
-    let port_name = resolve_port(
-        port,
-        LOG_VID,
-        LOG_PID,
-        &[LOG_COMM_INTERFACE, LOG_DATA_INTERFACE],
-    )?;
+    let port_name = resolve_log_port(port)?;
     log::info!("Select {}", port_name);
 
     let mut logcom = serialport::new(&port_name, 115200)
@@ -1451,4 +1372,21 @@ fn cmd_reboot(port: &str) -> Result<()> {
     serial::detect::reboot_on_port(logcom.as_mut())?;
     log::info!("reboot sent on {}", port_name);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn luatos_script_target_preserves_flexfile_xip_convention() {
+        let target = luatos_script_target(0x003A_0000).unwrap();
+        assert_eq!(target.image_type, ImageKind::FlexFile);
+        assert_eq!(target.storage, FlashStorage::ApFlash);
+        assert_eq!(target.address, 0x00BA_0000);
+        assert_eq!(target.tag, "SCRIPT");
+
+        let already_biased = luatos_script_target(0x00BA_0000).unwrap();
+        assert_eq!(already_biased.address, 0x00BA_0000);
+    }
 }

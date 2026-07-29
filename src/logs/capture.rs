@@ -1,3 +1,5 @@
+use ectool_core::util::printf::{fmt_printf, read_len_prefixed_string};
+
 /// Context for incremental log parsing, holding partial data between reads.
 pub struct LogContext {
     pub buffer: Vec<u8>,
@@ -37,23 +39,6 @@ pub struct LogMessage {
     pub text: String,
     /// Device tick in milliseconds (from frame header word 1).
     pub tick_ms: u32,
-}
-
-fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
-    data.get(offset..offset + 4)
-        .and_then(|s| s.try_into().ok())
-        .map(u32::from_le_bytes)
-}
-
-fn read_len_prefixed_string(data: &[u8], offset: &mut usize) -> Option<String> {
-    *offset = (*offset + 3) & !3;
-    let len = read_u32(data, *offset)? as usize;
-    *offset += 4;
-    let bytes = data.get(*offset..*offset + len)?;
-    let s = String::from_utf8_lossy(bytes).to_string();
-    *offset += len;
-    *offset = (*offset + 3) & !3;
-    Some(s)
 }
 
 /// Parse a single log frame: 12-byte header + format string + data.
@@ -116,174 +101,6 @@ fn log_split(data: &[u8]) -> Option<LogMessage> {
         rest
     );
     None
-}
-
-/// Basic printf-style formatter: walks the format string and substitutes
-/// %d/%i/%u/%x/%X/%s/%.*s/%p from a binary argument stream (4-byte aligned LE).
-fn fmt_printf(fmt: &str, data: &[u8]) -> String {
-    let mut out = String::new();
-    let mut offset = 0;
-    let chars: Vec<char> = fmt.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        if chars[i] != '%' {
-            out.push(chars[i]);
-            i += 1;
-            continue;
-        }
-
-        i += 1; // skip '%'
-        if i >= chars.len() {
-            break;
-        }
-
-        // Handle %%
-        if chars[i] == '%' {
-            out.push('%');
-            i += 1;
-            continue;
-        }
-
-        // Skip flags: -, +, 0, space, #
-        while i < chars.len() && "-+ 0#".contains(chars[i]) {
-            i += 1;
-        }
-        // Skip width (digits or *)
-        if i < chars.len() && chars[i] == '*' {
-            // width from arg
-            offset = (offset + 3) & !3;
-            if offset + 4 <= data.len() {
-                // consume but don't use for output
-                offset += 4;
-            }
-            i += 1;
-        } else {
-            while i < chars.len() && chars[i].is_ascii_digit() {
-                i += 1;
-            }
-        }
-        // Skip precision
-        if i < chars.len() && chars[i] == '.' {
-            i += 1;
-            if i < chars.len() && chars[i] == '*' {
-                // precision from arg
-                offset = (offset + 3) & !3;
-                let prec = if offset + 4 <= data.len() {
-                    let v =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0; 4]));
-                    offset += 4;
-                    v as usize
-                } else {
-                    0
-                };
-
-                i += 1;
-                if i < chars.len() && chars[i] == 's' {
-                    // %.*s: precision-limited string from pointer
-                    // In trace protocol, data is inline after the length
-                    if offset + prec <= data.len() {
-                        let s = String::from_utf8_lossy(&data[offset..offset + prec]);
-                        out.push_str(&s);
-                        offset += prec;
-                    }
-                    i += 1;
-                    continue;
-                }
-            } else {
-                while i < chars.len() && chars[i].is_ascii_digit() {
-                    i += 1;
-                }
-            }
-        }
-        // Skip length modifier: l, ll, h, hh, z
-        if i < chars.len() && chars[i] == 'l' {
-            i += 1;
-            if i < chars.len() && chars[i] == 'l' {
-                i += 1;
-            }
-        } else if i < chars.len() && (chars[i] == 'h' || chars[i] == 'z') {
-            i += 1;
-            if i < chars.len() && chars[i] == 'h' {
-                i += 1;
-            }
-        }
-
-        if i >= chars.len() {
-            break;
-        }
-
-        let spec = chars[i];
-        i += 1;
-
-        match spec {
-            'd' | 'i' => {
-                offset = (offset + 3) & !3;
-                if offset + 4 <= data.len() {
-                    let v =
-                        i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0; 4]));
-                    out.push_str(&v.to_string());
-                    offset += 4;
-                }
-            }
-            'u' => {
-                offset = (offset + 3) & !3;
-                if offset + 4 <= data.len() {
-                    let v =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0; 4]));
-                    out.push_str(&v.to_string());
-                    offset += 4;
-                }
-            }
-            'x' => {
-                offset = (offset + 3) & !3;
-                if offset + 4 <= data.len() {
-                    let v =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0; 4]));
-                    out.push_str(&format!("{:x}", v));
-                    offset += 4;
-                }
-            }
-            'X' => {
-                offset = (offset + 3) & !3;
-                if offset + 4 <= data.len() {
-                    let v =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0; 4]));
-                    out.push_str(&format!("{:X}", v));
-                    offset += 4;
-                }
-            }
-            'p' => {
-                offset = (offset + 3) & !3;
-                if offset + 4 <= data.len() {
-                    let v =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap_or([0; 4]));
-                    out.push_str(&format!("0x{:x}", v));
-                    offset += 4;
-                }
-            }
-            's' => {
-                if let Some(s) = read_len_prefixed_string(data, &mut offset) {
-                    out.push_str(&s);
-                }
-            }
-            'c' => {
-                offset = (offset + 3) & !3;
-                if offset + 4 <= data.len() {
-                    let v = data[offset];
-                    out.push(v as char);
-                    offset += 4;
-                }
-            }
-            _ => {
-                // Unknown specifier, output literally
-                out.push('%');
-                out.push(spec);
-            }
-        }
-    }
-
-    out
 }
 
 /// Parse incoming serial data for log frames delimited by 0x7E.
@@ -356,10 +173,6 @@ mod tests {
 
     #[test]
     fn test_log_parse_sample() {
-        // Sample from eclogs.py
-        let hex_str = "7E599902000000000004CEA730A252E2A7300000000001C00000049\
-                        2F757365722E4750494F09476F20476F20476F09300945433631387E";
-        // We can't easily use this hex directly but the unpack test above verifies the core logic.
         let mut ctx = LogContext::new();
         let data = vec![0x7E, 0x00, 0x7E]; // minimal empty frame
         let msgs = log_parse(&mut ctx, &data);

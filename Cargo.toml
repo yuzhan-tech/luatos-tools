@@ -5,11 +5,11 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+ectool_core = { package = "ectool", git = "https://github.com/yuzhan-tech/ectool.git", tag = "v0.1.0", default-features = false, features = ["unilog"] }
 clap = { version = "4", features = ["derive"] }
 serialport = { version = "4", features = ["usbportinfo-interface"] }
 sevenz-rust2 = { version = "0.20", features = ["compress"] }
 sha2 = "0.10"
-crc32fast = "1"
 md5 = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -19,7 +19,6 @@ env_logger = "0.11"
 anyhow = "1"
 chrono = "0.4"
 crossterm = "0.28"
-hex = "0.4"
 regex = "1"
 tempfile = "3"
 
